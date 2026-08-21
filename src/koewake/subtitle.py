@@ -508,6 +508,27 @@ def build_cues(segments: list[Segment], options: LayoutOptions) -> list[Cue]:
     return normalize_timing(cues, options)
 
 
+def build_cues_by_speaker(
+    segments: list[Segment], options: LayoutOptions
+) -> dict[str | None, list[Cue]]:
+    """話者ごとに分けてキューを組み立てる。
+
+    表示時間の調整（重なりの除去）は**話者ごとに独立して**かける。
+    別々のSRTとして別トラックに載せるので、話者どうしの発言が時間的に
+    重なるのはむしろ自然であり、そこをずらしてしまうと音とズレる。
+    """
+    grouped: dict[str | None, list[Segment]] = {}
+    for segment in segments:
+        grouped.setdefault(segment.speaker, []).append(segment)
+
+    result: dict[str | None, list[Cue]] = {}
+    for speaker, items in grouped.items():
+        cues = build_cues(items, options)
+        if cues:
+            result[speaker] = cues
+    return result
+
+
 def format_timestamp(seconds: float) -> str:
     if seconds < 0:
         seconds = 0.0

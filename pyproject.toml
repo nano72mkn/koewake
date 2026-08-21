@@ -10,14 +10,20 @@ authors = [{ name = "nano72mkn" }]
 dependencies = [
     "faster-whisper>=1.1.0",
     "imageio-ffmpeg>=0.5.1",
+    # 話者分離（Phase 2）。PyTorch も HuggingFace のトークンも要らない。
+    #
+    # sherpa-onnx の wheel はネイティブライブラリを含まず（2MBしかない）、
+    # 実体は sherpa-onnx-core にある。ところが wheel のメタデータに
+    # その依存が書かれていないため、uv が core を入れてくれず、
+    # import が libonnxruntime 不足で落ちる。
+    # 直るまでは core を明示的に、同じバージョンで指定しておく。
+    "sherpa-onnx==1.13.6",
+    "sherpa-onnx-core==1.13.6",
+    "numpy>=1.24",
 ]
 
 [project.scripts]
 koewake = "koewake.cli:run"
-
-[project.optional-dependencies]
-# Phase 2 (話者分離) 用。Phase 1 では不要。
-diarize = ["sherpa-onnx>=1.10.30"]
 
 [build-system]
 requires = ["hatchling"]

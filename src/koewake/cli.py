@@ -14,18 +14,20 @@ import json
 import shutil
 import sys
 import time
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 from koewake import __version__
 from koewake.audio import MEDIA_SUFFIXES, extract_audio, is_vertical, probe_duration
+from koewake.diarize import DiarizationUnavailable, assign_speakers, diarize
 from koewake.engine import DEFAULT_QUALITY, QUALITY_PRESETS, EngineConfig, resolve_engine
 from koewake.progress import Progress
 from koewake.subtitle import (
     VERTICAL_LAYOUT,
+    Cue,
     LayoutOptions,
     Segment,
-    build_cues,
+    build_cues_by_speaker,
     render_srt,
 )
 from koewake.transcribe import TranscribeOptions, load_model, load_vocabulary, transcribe
@@ -70,9 +72,9 @@ class Outcome:
     SKIPPED = "skipped"
     FAILED = "failed"
 
-    def __init__(self, status: str, path: Path | None = None) -> None:
+    def __init__(self, status: str, paths: list[Path] | None = None) -> None:
         self.status = status
-        self.path = path
+        self.paths = paths or []
 
 
 ENCODINGS = {
@@ -138,6 +140,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--save-transcript", action="store_true", help="文字起こしの生データを .json でも残す"
     )
+    parser.add_argument(
+        "--speakers",
+        metavar="auto|人数",
+        help="話者ごとに別々のSRTを出す。人数が分かっていれば数字で指定する（例: --speakers 2）",
+    )
+    parser.add_argument(
+        "--speaker-names",
+        metavar="名前,名前",
+        help="話者につける名前をカンマ区切りで（喋り始めた順）。例: --speaker-names ホスト,ゲスト",
+    )
     parser.add_argument("--overwrite", action="store_true", help="既存のSRTを上書きする")
     parser.add_argument(
         "--no-progress", action="store_true", help="進捗のアニメーションを出さない"
@@ -189,46 +201,117 @@ class Session:
     initial_prompt: str
     models: ModelCache
     progress: Progress
+    # None = 話者分離をしない / 0 = 人数は自動判定 / 1以上 = その人数
+    speakers: int | None = None
+    speaker_names: list[str] = field(default_factory=list)
 
 
-def _transcribe_file(source: Path, session: Session, duration: float | None) -> list[Segment]:
-    """音声を取り出して文字起こしする。一時ファイルは必ず片付ける。"""
-    progress = session.progress
-    work_dir = None
+def _extract(source: Path, session: Session) -> Path:
+    session.progress.start("音声を取り出しています")
     try:
-        progress.start("音声を取り出しています")
-        try:
-            audio_path = extract_audio(source)
-        finally:
-            progress.finish()
-        work_dir = audio_path.parent
-
-        model = session.models.get()
-
-        # 最初のひとまとまりが返るまでは、進み具合が本当に分からない。
-        # 0% のバーを出すと止まって見えるので、それまでは経過時間だけ出す。
-        progress.start("音声を解析しています")
-
-        def on_progress(ratio: float, text: str) -> None:
-            progress.update(
-                ratio=ratio if duration else None, detail=text, label="文字起こし中"
-            )
-
-        try:
-            return transcribe(
-                model,
-                audio_path,
-                TranscribeOptions(
-                    language=session.args.language, initial_prompt=session.initial_prompt
-                ),
-                duration=duration,
-                on_progress=on_progress,
-            )
-        finally:
-            progress.finish()
+        return extract_audio(source)
     finally:
-        if work_dir and work_dir.name.startswith("koewake-"):
-            shutil.rmtree(work_dir, ignore_errors=True)
+        session.progress.finish()
+
+
+def _transcribe_audio(
+    audio_path: Path, session: Session, duration: float | None
+) -> list[Segment]:
+    progress = session.progress
+    model = session.models.get()
+
+    # 最初のひとまとまりが返るまでは、進み具合が本当に分からない。
+    # 0% のバーを出すと止まって見えるので、それまでは経過時間だけ出す。
+    progress.start("音声を解析しています")
+
+    def on_progress(ratio: float, text: str) -> None:
+        progress.update(ratio=ratio if duration else None, detail=text, label="文字起こし中")
+
+    try:
+        return transcribe(
+            model,
+            audio_path,
+            TranscribeOptions(
+                language=session.args.language, initial_prompt=session.initial_prompt
+            ),
+            duration=duration,
+            on_progress=on_progress,
+        )
+    finally:
+        progress.finish()
+
+
+def _apply_diarization(
+    audio_path: Path, segments: list[Segment], session: Session
+) -> list[Segment]:
+    """話者を判別して、各区間に割り当てる。
+
+    失敗しても字幕そのものは作れるので、警告だけ出して1本のSRTに落とす。
+    """
+    progress = session.progress
+    progress.start("声から話者を判別しています")
+    try:
+        turns = diarize(
+            audio_path,
+            speakers=session.speakers or None,
+            on_progress=lambda ratio, detail: progress.update(
+                ratio=ratio, detail=detail, label="話者分離モデルを準備しています"
+            ),
+        )
+    except DiarizationUnavailable as exc:
+        progress.finish()
+        _log(f"  [警告] 話者分離ができませんでした: {exc}")
+        _log("         話者で分けずに、1本のSRTを作ります。")
+        return segments
+    finally:
+        progress.finish()
+
+    if not turns:
+        _log("  [警告] 話者を判別できませんでした。1本のSRTを作ります。")
+        return segments
+
+    found = len({turn.speaker for turn in turns})
+    _log(f"  話者     : {found}人を検出")
+    return assign_speakers(segments, turns)
+
+
+def _existing_outputs(output_dir: Path, stem: str, diarizing: bool) -> list[Path]:
+    if not diarizing:
+        single = output_dir / f"{stem}.srt"
+        return [single] if single.exists() else []
+
+    prefix = f"{stem}_"
+    return sorted(
+        path
+        for path in output_dir.iterdir()
+        if path.is_file() and path.suffix == ".srt" and path.name.startswith(prefix)
+    )
+
+
+def _write_outputs(
+    source: Path,
+    output_dir: Path,
+    segments: list[Segment],
+    layout: LayoutOptions,
+    session: Session,
+) -> list[tuple[Path, int]]:
+    session.progress.start("字幕として整形しています")
+    try:
+        grouped = build_cues_by_speaker(segments, layout)
+    finally:
+        session.progress.finish()
+
+    written: list[tuple[Path, int]] = []
+    for speaker in sorted(grouped, key=_speaker_sort_key):
+        cues: list[Cue] = grouped[speaker]
+        path = output_dir / speaker_filename(
+            source.stem, speaker, session.speaker_names
+        )
+        path.write_text(
+            render_srt(cues), encoding=ENCODINGS[session.args.encoding], newline=""
+        )
+        written.append((path, len(cues)))
+    return written
 
 
 def process_one(source: Path, session: Session, position: str = "") -> Outcome:
@@ -243,9 +326,12 @@ def process_one(source: Path, session: Session, position: str = "") -> Outcome:
 
     output_dir = args.output_dir or source.parent
     output_dir.mkdir(parents=True, exist_ok=True)
-    srt_path = output_dir / f"{source.stem}.srt"
-    if srt_path.exists() and not args.overwrite:
-        _log(f"[スキップ] すでにSRTがあります（--overwrite で上書き）: {srt_path.name}")
+
+    diarizing = session.speakers is not None
+    existing = _existing_outputs(output_dir, source.stem, diarizing)
+    if existing and not args.overwrite:
+        names = "、".join(path.name for path in existing[:3])
+        _log(f"[スキップ] すでにSRTがあります（--overwrite で上書き）: {names}")
         return Outcome(Outcome.SKIPPED)
 
     layout = resolve_layout(args, source)
@@ -258,17 +344,23 @@ def process_one(source: Path, session: Session, position: str = "") -> Outcome:
         _log(f"  尺       : {_format_seconds(duration)}")
 
     started = time.monotonic()
-    segments = _transcribe_file(source, session, duration)
-    if not segments:
-        _log("  [失敗] 音声から文字を取れませんでした（無音・BGMのみの可能性）")
-        return Outcome(Outcome.FAILED)
-
-    session.progress.start("字幕として整形しています")
+    work_dir = None
     try:
-        cues = build_cues(segments, layout)
-        srt_path.write_text(render_srt(cues), encoding=ENCODINGS[args.encoding], newline="")
+        audio_path = _extract(source, session)
+        work_dir = audio_path.parent
+
+        segments = _transcribe_audio(audio_path, session, duration)
+        if not segments:
+            _log("  [失敗] 音声から文字を取れませんでした（無音・BGMのみの可能性）")
+            return Outcome(Outcome.FAILED)
+
+        if diarizing:
+            segments = _apply_diarization(audio_path, segments, session)
     finally:
-        session.progress.finish()
+        if work_dir and work_dir.name.startswith("koewake-"):
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+    written = _write_outputs(source, output_dir, segments, layout, session)
 
     if args.save_transcript:
         transcript_path = output_dir / f"{source.stem}.transcript.json"
@@ -279,8 +371,71 @@ def process_one(source: Path, session: Session, position: str = "") -> Outcome:
         _log(f"  文字起こしデータ: {transcript_path.name}")
 
     elapsed = time.monotonic() - started
-    _log(f"  [完了] {srt_path}（字幕 {len(cues)} 枚 / 所要 {_format_seconds(elapsed)}）")
-    return Outcome(Outcome.MADE, srt_path)
+    _log(f"  [完了] 所要 {_format_seconds(elapsed)}")
+    for path, count in written:
+        _log(f"    {path}（字幕 {count} 枚）")
+    return Outcome(Outcome.MADE, [path for path, _ in written])
+
+
+# ファイル名に使えない文字（Windows / macOS の両方を満たす範囲）
+_UNSAFE_IN_FILENAME = str.maketrans({char: "_" for char in '\\/:*?"<>|'})
+
+
+def parse_speakers(value: str | None) -> int | None:
+    """`--speakers` の値を解釈する。
+
+    None       -> 話者分離をしない
+    "auto"     -> 人数は自動判定（0 を返す）
+    "2" など   -> その人数
+    """
+    if value is None:
+        return None
+    text = value.strip().lower()
+    if text in ("auto", "自動"):
+        return 0
+    try:
+        count = int(text)
+    except ValueError as exc:
+        raise ValueError(
+            f"--speakers には auto か人数を指定してください（受け取った値: {value}）"
+        ) from exc
+    if count < 1:
+        raise ValueError("--speakers の人数は1以上にしてください")
+    return count
+
+
+def parse_speaker_names(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [name.strip() for name in value.split(",") if name.strip()]
+
+
+def speaker_filename(stem: str, speaker: str | None, names: list[str]) -> str:
+    """話者ごとのSRTのファイル名。"""
+    if speaker is None:
+        return f"{stem}.srt"
+
+    label = speaker
+    # 「話者2」の 2 番目 -> names[1]
+    if speaker.startswith("話者"):
+        try:
+            index = int(speaker.removeprefix("話者")) - 1
+        except ValueError:
+            index = -1
+        if 0 <= index < len(names):
+            label = names[index]
+
+    return f"{stem}_{label.translate(_UNSAFE_IN_FILENAME)}.srt"
+
+
+def _speaker_sort_key(speaker: str | None) -> tuple[int, int | str]:
+    if speaker is None:
+        return (0, 0)
+    if speaker.startswith("話者"):
+        suffix = speaker.removeprefix("話者")
+        if suffix.isdigit():
+            return (1, int(suffix))
+    return (2, speaker)
 
 
 def _report(made: list[Path], failed: int) -> None:
@@ -312,6 +467,16 @@ def main(argv: list[str] | None = None) -> int:
         _log("[エラー] 処理できるファイルがありませんでした。")
         return 1
 
+    try:
+        speakers = parse_speakers(args.speakers)
+    except ValueError as exc:
+        _log(f"[エラー] {exc}")
+        return 1
+    speaker_names = parse_speaker_names(args.speaker_names)
+    if speaker_names and speakers is None:
+        _log("[エラー] --speaker-names は --speakers と一緒に指定してください。")
+        return 1
+
     engine = resolve_engine(quality=args.quality, model=args.model, device=args.device)
     progress = Progress(enabled=False if args.no_progress else None)
     session = Session(
@@ -319,6 +484,8 @@ def main(argv: list[str] | None = None) -> int:
         initial_prompt=initial_prompt,
         models=ModelCache(engine, progress),
         progress=progress,
+        speakers=speakers,
+        speaker_names=speaker_names,
     )
 
     made: list[Path] = []
@@ -337,8 +504,8 @@ def main(argv: list[str] | None = None) -> int:
             _log(f"  [エラー] {source.name}: {exc}")
             continue
 
-        if outcome.status == Outcome.MADE and outcome.path:
-            made.append(outcome.path)
+        if outcome.status == Outcome.MADE and outcome.paths:
+            made.extend(outcome.paths)
         elif outcome.status == Outcome.FAILED:
             failed += 1
 
