@@ -9,19 +9,54 @@ Windows/macOS の D&D スクリプトからもここが呼ばれる。
 from __future__ import annotations
 
 import argparse
+import gc
 import json
-import os
 import shutil
 import sys
 import time
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 from koewake import __version__
 from koewake.audio import MEDIA_SUFFIXES, extract_audio, is_vertical, probe_duration
-from koewake.engine import DEFAULT_QUALITY, QUALITY_PRESETS, resolve_engine
-from koewake.subtitle import VERTICAL_LAYOUT, LayoutOptions, build_cues, render_srt
-from koewake.transcribe import TranscribeOptions, load_vocabulary, transcribe
+from koewake.engine import DEFAULT_QUALITY, QUALITY_PRESETS, EngineConfig, resolve_engine
+from koewake.progress import Progress
+from koewake.subtitle import (
+    VERTICAL_LAYOUT,
+    LayoutOptions,
+    Segment,
+    build_cues,
+    render_srt,
+)
+from koewake.transcribe import TranscribeOptions, load_model, load_vocabulary, transcribe
+
+
+class ModelCache:
+    """Whisper のモデルを1回だけ読み込んで使い回す。
+
+    ファイルごとに読み直すと、複数ドロップしたときに毎回 1.5GB を
+    読み込むことになる。初回だけダウンロードが走るので、その間も
+    「止まっていない」ことが分かるよう進捗表示を出す。
+    """
+
+    def __init__(self, engine: EngineConfig, progress: Progress) -> None:
+        self.engine = engine
+        self.progress = progress
+        self._model = None
+
+    def get(self):
+        if self._model is None:
+            self.progress.start("モデルを準備しています（初回はダウンロードあり）")
+            try:
+                self._model = load_model(
+                    self.engine,
+                    on_progress=lambda ratio, detail: self.progress.update(
+                        ratio=ratio, detail=detail, label="モデルをダウンロード中"
+                    ),
+                )
+            finally:
+                self.progress.finish()
+        return self._model
 
 
 class Outcome:
@@ -104,6 +139,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--save-transcript", action="store_true", help="文字起こしの生データを .json でも残す"
     )
     parser.add_argument("--overwrite", action="store_true", help="既存のSRTを上書きする")
+    parser.add_argument(
+        "--no-progress", action="store_true", help="進捗のアニメーションを出さない"
+    )
     parser.add_argument("--version", action="version", version=f"koewake {__version__}")
     return parser
 
@@ -143,7 +181,59 @@ def collect_inputs(paths: list[Path]) -> list[Path]:
     return collected
 
 
-def process_one(source: Path, args: argparse.Namespace, initial_prompt: str) -> Outcome:
+@dataclass
+class Session:
+    """1回の実行を通して共有するもの。"""
+
+    args: argparse.Namespace
+    initial_prompt: str
+    models: ModelCache
+    progress: Progress
+
+
+def _transcribe_file(source: Path, session: Session, duration: float | None) -> list[Segment]:
+    """音声を取り出して文字起こしする。一時ファイルは必ず片付ける。"""
+    progress = session.progress
+    work_dir = None
+    try:
+        progress.start("音声を取り出しています")
+        try:
+            audio_path = extract_audio(source)
+        finally:
+            progress.finish()
+        work_dir = audio_path.parent
+
+        model = session.models.get()
+
+        # 最初のひとまとまりが返るまでは、進み具合が本当に分からない。
+        # 0% のバーを出すと止まって見えるので、それまでは経過時間だけ出す。
+        progress.start("音声を解析しています")
+
+        def on_progress(ratio: float, text: str) -> None:
+            progress.update(
+                ratio=ratio if duration else None, detail=text, label="文字起こし中"
+            )
+
+        try:
+            return transcribe(
+                model,
+                audio_path,
+                TranscribeOptions(
+                    language=session.args.language, initial_prompt=session.initial_prompt
+                ),
+                duration=duration,
+                on_progress=on_progress,
+            )
+        finally:
+            progress.finish()
+    finally:
+        if work_dir and work_dir.name.startswith("koewake-"):
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def process_one(source: Path, session: Session, position: str = "") -> Outcome:
+    args = session.args
+
     if not source.exists():
         _log(f"[エラー] ファイルが見つかりません: {source}")
         return Outcome(Outcome.FAILED)
@@ -158,70 +248,39 @@ def process_one(source: Path, args: argparse.Namespace, initial_prompt: str) -> 
         _log(f"[スキップ] すでにSRTがあります（--overwrite で上書き）: {srt_path.name}")
         return Outcome(Outcome.SKIPPED)
 
-    engine = resolve_engine(quality=args.quality, model=args.model, device=args.device)
     layout = resolve_layout(args, source)
-
-    _log(f"\n=== {source.name} ===")
-    _log(f"  エンジン : {engine.describe()}")
-    _log(f"  字幕     : 1行{layout.max_chars_per_line}文字 x 最大{layout.max_lines}行")
-
     duration = probe_duration(source)
+
+    _log(f"\n=== {position}{source.name} ===")
+    _log(f"  エンジン : {session.models.engine.describe()}")
+    _log(f"  字幕     : 1行{layout.max_chars_per_line}文字 x 最大{layout.max_lines}行")
     if duration:
         _log(f"  尺       : {_format_seconds(duration)}")
 
     started = time.monotonic()
-    work_dir = None
+    segments = _transcribe_file(source, session, duration)
+    if not segments:
+        _log("  [失敗] 音声から文字を取れませんでした（無音・BGMのみの可能性）")
+        return Outcome(Outcome.FAILED)
+
+    session.progress.start("字幕として整形しています")
     try:
-        _log("  [1/3] 音声を取り出しています...")
-        audio_path = extract_audio(source)
-        work_dir = audio_path.parent
-
-        _log("  [2/3] 文字起こし中...（初回はモデルのダウンロードで数分かかります）")
-
-        last_shown = -1.0
-
-        def on_progress(ratio: float, text: str) -> None:
-            nonlocal last_shown
-            percent = ratio * 100
-            if percent - last_shown < 2.0:
-                return
-            last_shown = percent
-            print(f"\r      {percent:5.1f}%  {text[:20]}", end="", flush=True)
-
-        segments = transcribe(
-            audio_path,
-            engine,
-            TranscribeOptions(language=args.language, initial_prompt=initial_prompt),
-            duration=duration,
-            on_progress=on_progress,
-        )
-        print("\r" + " " * 78, end="\r", flush=True)
-
-        if not segments:
-            _log("  [失敗] 音声から文字を取れませんでした（無音・BGMのみの可能性）")
-            return Outcome(Outcome.FAILED)
-
-        _log("  [3/3] 字幕として整形しています...")
         cues = build_cues(segments, layout)
-
-        srt_path.write_text(
-            render_srt(cues), encoding=ENCODINGS[args.encoding], newline=""
-        )
-
-        if args.save_transcript:
-            transcript_path = output_dir / f"{source.stem}.transcript.json"
-            transcript_path.write_text(
-                json.dumps([asdict(segment) for segment in segments], ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            _log(f"  文字起こしデータ: {transcript_path.name}")
-
-        elapsed = time.monotonic() - started
-        _log(f"  [完了] {srt_path}（字幕 {len(cues)} 枚 / 所要 {_format_seconds(elapsed)}）")
-        return Outcome(Outcome.MADE, srt_path)
+        srt_path.write_text(render_srt(cues), encoding=ENCODINGS[args.encoding], newline="")
     finally:
-        if work_dir and work_dir.name.startswith("koewake-"):
-            shutil.rmtree(work_dir, ignore_errors=True)
+        session.progress.finish()
+
+    if args.save_transcript:
+        transcript_path = output_dir / f"{source.stem}.transcript.json"
+        transcript_path.write_text(
+            json.dumps([asdict(segment) for segment in segments], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        _log(f"  文字起こしデータ: {transcript_path.name}")
+
+    elapsed = time.monotonic() - started
+    _log(f"  [完了] {srt_path}（字幕 {len(cues)} 枚 / 所要 {_format_seconds(elapsed)}）")
+    return Outcome(Outcome.MADE, srt_path)
 
 
 def _report(made: list[Path], failed: int) -> None:
@@ -253,15 +312,27 @@ def main(argv: list[str] | None = None) -> int:
         _log("[エラー] 処理できるファイルがありませんでした。")
         return 1
 
+    engine = resolve_engine(quality=args.quality, model=args.model, device=args.device)
+    progress = Progress(enabled=False if args.no_progress else None)
+    session = Session(
+        args=args,
+        initial_prompt=initial_prompt,
+        models=ModelCache(engine, progress),
+        progress=progress,
+    )
+
     made: list[Path] = []
     failed = 0
-    for source in sources:
+    for index, source in enumerate(sources, start=1):
+        position = f"[{index}/{len(sources)}] " if len(sources) > 1 else ""
         try:
-            outcome = process_one(source, args, initial_prompt)
+            outcome = process_one(source, session, position)
         except KeyboardInterrupt:
+            progress.finish()
             _log("\n中断しました。")
             return 130
         except Exception as exc:
+            progress.finish()
             failed += 1
             _log(f"  [エラー] {source.name}: {exc}")
             continue
@@ -278,17 +349,18 @@ def main(argv: list[str] | None = None) -> int:
 def run() -> None:
     """コンソールスクリプトの入口。
 
-    faster-whisper が使う CTranslate2 は、終了時の後片付けで
-    まれにクラッシュする（macOS の `recursive_mutex lock failed`）。
-    SRT を書き終えたあとなので実害は無いが、そのままだと D&D スクリプトが
-    成功した実行を「失敗した」と表示してしまう。
-    出力を流し切ってから、後片付けを待たずにプロセスを終える。
-    （一時ファイルは process_one の finally で消してある）
+    faster-whisper が使う CTranslate2 は、インタプリタ終了時の後片付けで
+    まれにクラッシュすることがある（macOS の `recursive_mutex lock failed`）。
+    終了処理が始まる前にモデルを解放しきってしまえば、そこを通らずに済む。
+
+    （以前はここで os._exit していたが、multiprocessing の後始末を飛ばすため
+    「leaked semaphore」の警告が毎回出てしまい、かえって不安にさせるのでやめた）
     """
     code = main()
+    gc.collect()
     sys.stdout.flush()
     sys.stderr.flush()
-    os._exit(code)
+    return sys.exit(code)
 
 
 if __name__ == "__main__":

@@ -6,12 +6,15 @@
 
 from __future__ import annotations
 
+import os
 import re
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 from koewake.engine import EngineConfig
+from koewake.progress import format_bytes
 from koewake.subtitle import Segment, Word
 
 ProgressCallback = Callable[[float, str], None]
@@ -84,23 +87,111 @@ def load_vocabulary(path: Path) -> str:
     return "、".join(terms) + "。"
 
 
-def transcribe(
-    audio_path: Path,
-    engine: EngineConfig,
-    options: TranscribeOptions | None = None,
-    duration: float | None = None,
-    on_progress: ProgressCallback | None = None,
-) -> list[Segment]:
+def _byte_progress_tqdm(on_progress: ProgressCallback):
+    """huggingface_hub に渡す tqdm 互換クラスを作る。
+
+    描画はさせず、バイト数だけを `on_progress` に流す。
+
+    注意点が2つある。
+    - `total` は生成時には 0 で、ダウンロードが始まってから設定される。
+      なので合計は update のたびに読み直す。
+    - バイトのバーは複数作られる（ダウンロード用と、xet の再構築用）。
+      二重に数えないよう、最初のひとつだけを見る。
+    - `disable=True` の tqdm は `self.n` を更新しないので、進んだ量は自分で数える。
+    """
+    from tqdm.auto import tqdm as base_tqdm
+
+    lock = threading.Lock()
+    tracked: list[object] = []
+
+    class ByteProgressTqdm(base_tqdm):
+        def __init__(self, *args, **kwargs):
+            kwargs["disable"] = True
+            super().__init__(*args, **kwargs)
+            self._tracked = False
+            self._done = 0
+            if kwargs.get("unit") == "B":
+                with lock:
+                    if not tracked:
+                        tracked.append(self)
+                        self._tracked = True
+
+        def update(self, n=1):
+            result = super().update(n)
+            if self._tracked:
+                self._done += n
+                if self.total:
+                    on_progress(
+                        min(self._done / self.total, 1.0),
+                        f"{format_bytes(self._done)} / {format_bytes(self.total)}",
+                    )
+            return result
+
+    return ByteProgressTqdm
+
+
+def download_model(name: str, on_progress: ProgressCallback | None = None) -> str:
+    """モデルを取得して、ローカルのパスを返す。取得済みならすぐ返る。
+
+    faster-whisper 自身はダウンロード進捗を潰している（`tqdm_class=disabled_tqdm`）ので、
+    ここは自前で `snapshot_download` を呼び、何MB進んだかを拾えるようにしている。
+    1.5GB のダウンロードが無反応に見えるのが一番つらいため。
+    """
+    # 「HF_TOKEN を設定すると速いよ」という案内を黙らせる。公開モデルを取るだけなので
+    # 不要な上、進捗表示に割り込んで行が乱れる。
+    # （logging の setLevel は huggingface_hub 側があとから上書きするので効かない）
+    os.environ.setdefault("HF_HUB_VERBOSITY", "error")
+
+    import huggingface_hub
+    from faster_whisper.utils import _MODELS
+
+    kwargs = {
+        "allow_patterns": [
+            "config.json",
+            "preprocessor_config.json",
+            "model.bin",
+            "tokenizer.json",
+            "vocabulary.*",
+        ],
+    }
+    if on_progress is not None:
+        kwargs["tqdm_class"] = _byte_progress_tqdm(on_progress)
+
+    return huggingface_hub.snapshot_download(_MODELS.get(name, name), **kwargs)
+
+
+def load_model(engine: EngineConfig, on_progress: ProgressCallback | None = None):
+    """Whisper のモデルを読み込む。
+
+    初回はモデル本体（large 系で 1.5GB 前後）をダウンロードするので時間がかかる。
+    複数ファイルを処理するときに読み直さずに済むよう、`transcribe()` から分けてある。
+    """
     from faster_whisper import WhisperModel
 
-    options = options or TranscribeOptions()
+    source = engine.model
+    try:
+        source = download_model(engine.model, on_progress)
+    except Exception:
+        # ダウンロード経路で何かあっても、WhisperModel 側の通常経路に任せれば動く。
+        # （ローカルパス指定・HF の仕様変更・オフラインでキャッシュ済み など）
+        source = engine.model
 
-    model = WhisperModel(
-        engine.model,
+    return WhisperModel(
+        source,
         device=engine.device,
         compute_type=engine.compute_type,
         cpu_threads=engine.cpu_threads,
     )
+
+
+def transcribe(
+    model,
+    audio_path: Path,
+    options: TranscribeOptions | None = None,
+    duration: float | None = None,
+    on_progress: ProgressCallback | None = None,
+) -> list[Segment]:
+    options = options or TranscribeOptions()
 
     raw_segments, _info = model.transcribe(
         str(audio_path),
