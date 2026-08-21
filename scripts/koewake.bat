@@ -8,8 +8,7 @@ if "%~1"=="" (
     echo 動画ファイルを、この koewake.bat のアイコンに
     echo ドラッグ＆ドロップしてください。
     echo （まとめて複数ドロップしてもOKです）
-    echo.
-    echo 複数人が喋っていれば、自動で人ごとに別々のSRTに分けます。
+
     echo.
     pause
     exit /b 1
@@ -22,8 +21,26 @@ if exist "%~dp0単語リスト.txt" set VOCAB=--vocab "%~dp0単語リスト.txt"
 where uv >nul 2>&1
 if errorlevel 1 set "PATH=%USERPROFILE%\.local\bin;%PATH%"
 
-rem 話者は自動判定。ひとりだけなら、いつもどおり1本のSRTになる。
-uv run koewake --speakers auto %VOCAB% %*
+echo.
+echo 話者ごとに別々のSRTに分けますか？
+echo   そのまま Enter =^> 分けない（1本のSRT）
+echo   人数を入力     =^> その人数で分ける（例: 2）
+echo   a              =^> 人数もおまかせで判定
+echo.
+set "ANSWER="
+set /p "ANSWER=話者: "
+
+rem 人数が分かっているなら a より数字のほうが確実（3人以上だと差が出る）
+set "SPEAKERS="
+if not "%ANSWER%"=="" (
+    if /i "%ANSWER%"=="a" (
+        set "SPEAKERS=--speakers auto"
+    ) else (
+        set "SPEAKERS=--speakers %ANSWER%"
+    )
+)
+
+uv run koewake %SPEAKERS% %VOCAB% %*
 set EXITCODE=%errorlevel%
 
 echo.

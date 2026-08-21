@@ -24,8 +24,7 @@ echo "=========================================="
 echo
 echo "動画ファイルを、このウィンドウにドラッグして Enter を押してください。"
 echo "（複数まとめてドラッグしてもOK / 何も入れずに Enter で終了）"
-echo
-echo "複数人が喋っていれば、自動で人ごとに別々のSRTに分けます。"
+
 echo
 printf "動画: "
 IFS= read -r dropped
@@ -46,8 +45,28 @@ if [ ${#paths[@]} -eq 0 ]; then
 fi
 
 # macOS の bash は 3.2 なので、空配列を "${a[@]}" で展開すると set -u で落ちる。
-# 話者は自動判定。ひとりだけなら、いつもどおり1本のSRTになる。
-uv run koewake --speakers auto ${VOCAB_ARGS[@]+"${VOCAB_ARGS[@]}"} "${paths[@]}"
+echo
+echo "話者ごとに別々のSRTに分けますか？"
+echo "  そのまま Enter → 分けない（1本のSRT）"
+echo "  人数を入力     → その人数で分ける（例: 2）"
+echo "  a              → 人数もおまかせで判定"
+echo
+printf "話者: "
+IFS= read -r answer
+
+# 人数が分かっているなら a より数字のほうが確実（3人以上だと差が出る）
+SPEAKER_ARGS=()
+case "$answer" in
+    "") ;;
+    [aA]|auto) SPEAKER_ARGS=(--speakers auto) ;;
+    *) SPEAKER_ARGS=(--speakers "$answer") ;;
+esac
+
+# macOS の bash は 3.2 なので、空配列を "${a[@]}" で展開すると set -u で落ちる
+uv run koewake \
+    ${SPEAKER_ARGS[@]+"${SPEAKER_ARGS[@]}"} \
+    ${VOCAB_ARGS[@]+"${VOCAB_ARGS[@]}"} \
+    "${paths[@]}"
 status=$?
 
 echo
