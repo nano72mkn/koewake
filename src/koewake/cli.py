@@ -276,16 +276,20 @@ def _apply_diarization(
 
 
 def _existing_outputs(output_dir: Path, stem: str, diarizing: bool) -> list[Path]:
+    single = output_dir / f"{stem}.srt"
     if not diarizing:
-        single = output_dir / f"{stem}.srt"
         return [single] if single.exists() else []
 
+    # 話者が1人だった場合は接尾辞なしで出るので、そちらも見る
     prefix = f"{stem}_"
-    return sorted(
+    found = [
         path
         for path in output_dir.iterdir()
         if path.is_file() and path.suffix == ".srt" and path.name.startswith(prefix)
-    )
+    ]
+    if single.exists():
+        found.append(single)
+    return sorted(found)
 
 
 def _write_outputs(
@@ -301,11 +305,15 @@ def _write_outputs(
     finally:
         session.progress.finish()
 
+    # ひとりしか居ないなら分ける意味がないので、従来どおり「動画名.srt」にする。
+    # （ソロ配信を毎回ドロップする使い方で、_話者1 が付くのは邪魔なだけ）
+    solo = len(grouped) == 1 and not session.speaker_names
+
     written: list[tuple[Path, int]] = []
     for speaker in sorted(grouped, key=_speaker_sort_key):
         cues: list[Cue] = grouped[speaker]
         path = output_dir / speaker_filename(
-            source.stem, speaker, session.speaker_names
+            source.stem, None if solo else speaker, session.speaker_names
         )
         path.write_text(
             render_srt(cues), encoding=ENCODINGS[session.args.encoding], newline=""

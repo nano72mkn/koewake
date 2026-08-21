@@ -116,3 +116,26 @@ def test_existing_per_speaker_srt_is_skipped(tmp_path, capsys):
     (tmp_path / "コラボ_話者1.srt").write_text("既にある", encoding="utf-8")
     assert main([str(video), "--speakers", "2"]) == 0
     assert "すでにSRTがあります" in capsys.readouterr().out
+
+
+def test_plain_srt_also_blocks_a_rerun_when_splitting(tmp_path, capsys):
+    """話者が1人だったときは接尾辞なしで出るので、そちらも既存として見る。"""
+    video = tmp_path / "ソロ.mp4"
+    video.write_bytes(b"not really a video")
+    (tmp_path / "ソロ.srt").write_text("既にある", encoding="utf-8")
+    assert main([str(video), "--speakers", "auto"]) == 0
+    assert "すでにSRTがあります" in capsys.readouterr().out
+
+
+def test_existing_outputs_finds_both_shapes(tmp_path):
+    from koewake.cli import _existing_outputs
+
+    (tmp_path / "配信.srt").write_text("x", encoding="utf-8")
+    (tmp_path / "配信_話者2.srt").write_text("x", encoding="utf-8")
+    (tmp_path / "別の動画.srt").write_text("x", encoding="utf-8")
+
+    names = {path.name for path in _existing_outputs(tmp_path, "配信", diarizing=True)}
+    assert names == {"配信.srt", "配信_話者2.srt"}
+
+    names = {path.name for path in _existing_outputs(tmp_path, "配信", diarizing=False)}
+    assert names == {"配信.srt"}

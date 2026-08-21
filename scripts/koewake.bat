@@ -9,6 +9,8 @@ if "%~1"=="" (
     echo ドラッグ＆ドロップしてください。
     echo （まとめて複数ドロップしてもOKです）
     echo.
+    echo 複数人が喋っていれば、自動で人ごとに別々のSRTに分けます。
+    echo.
     pause
     exit /b 1
 )
@@ -20,7 +22,8 @@ if exist "%~dp0単語リスト.txt" set VOCAB=--vocab "%~dp0単語リスト.txt"
 where uv >nul 2>&1
 if errorlevel 1 set "PATH=%USERPROFILE%\.local\bin;%PATH%"
 
-uv run koewake %VOCAB% %*
+rem 話者は自動判定。ひとりだけなら、いつもどおり1本のSRTになる。
+uv run koewake --speakers auto %VOCAB% %*
 set EXITCODE=%errorlevel%
 
 echo.

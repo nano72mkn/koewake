@@ -25,6 +25,8 @@ echo
 echo "動画ファイルを、このウィンドウにドラッグして Enter を押してください。"
 echo "（複数まとめてドラッグしてもOK / 何も入れずに Enter で終了）"
 echo
+echo "複数人が喋っていれば、自動で人ごとに別々のSRTに分けます。"
+echo
 printf "動画: "
 IFS= read -r dropped
 
@@ -44,7 +46,8 @@ if [ ${#paths[@]} -eq 0 ]; then
 fi
 
 # macOS の bash は 3.2 なので、空配列を "${a[@]}" で展開すると set -u で落ちる。
-uv run koewake ${VOCAB_ARGS[@]+"${VOCAB_ARGS[@]}"} "${paths[@]}"
+# 話者は自動判定。ひとりだけなら、いつもどおり1本のSRTになる。
+uv run koewake --speakers auto ${VOCAB_ARGS[@]+"${VOCAB_ARGS[@]}"} "${paths[@]}"
 status=$?
 
 echo
