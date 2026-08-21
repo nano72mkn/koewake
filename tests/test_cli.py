@@ -64,39 +64,105 @@ def test_parse_speakers():
     from koewake.cli import parse_speakers
 
     assert parse_speakers(None) is None
-    assert parse_speakers("auto") == 0
-    assert parse_speakers("自動") == 0
-    assert parse_speakers("2") == 2
-    assert parse_speakers(" 3 ") == 3
+    assert parse_speakers("auto") == [0]
+    assert parse_speakers("自動") == [0]
+    assert parse_speakers("2") == [2]
+    assert parse_speakers(" 3 ") == [3]
+    # トラックごとの人数
+    assert parse_speakers("1,2") == [1, 2]
+    assert parse_speakers("auto,2") == [0, 2]
 
-    for bad in ("いち", "0", "-1", ""):
+    for bad in ("いち", "0", "-1", "", ",", "1,x"):
         with pytest.raises(ValueError):
             parse_speakers(bad)
 
 
-def test_parse_speaker_names():
-    from koewake.cli import parse_speaker_names
+def test_speakers_for_track():
+    from koewake.cli import speakers_for_track
 
-    assert parse_speaker_names(None) == []
-    assert parse_speaker_names("") == []
-    assert parse_speaker_names("ホスト, ゲスト ,") == ["ホスト", "ゲスト"]
-
-
-def test_speaker_filename():
-    from koewake.cli import speaker_filename
-
-    assert speaker_filename("配信", None, []) == "配信.srt"
-    assert speaker_filename("配信", "話者1", []) == "配信_話者1.srt"
-    assert speaker_filename("配信", "話者2", ["ホスト", "ゲスト"]) == "配信_ゲスト.srt"
-    # 名前が足りない分は 話者N のまま
-    assert speaker_filename("配信", "話者3", ["ホスト", "ゲスト"]) == "配信_話者3.srt"
+    # 1つだけなら全トラックに同じ値
+    assert speakers_for_track([2], 0, 3) == 2
+    assert speakers_for_track([2], 2, 3) == 2
+    # トラック数と同じ個数ならトラックごと
+    assert speakers_for_track([1, 2], 0, 2) == 1
+    assert speakers_for_track([1, 2], 1, 2) == 2
+    # 数が合わなければエラー
+    with pytest.raises(ValueError, match="トラック"):
+        speakers_for_track([1, 2], 0, 3)
 
 
-def test_speaker_filename_sanitises_unsafe_characters():
-    from koewake.cli import speaker_filename
+def _slot(**kwargs):
+    from koewake.audio import AudioTrack
+    from koewake.cli import NameSlot
 
-    name = speaker_filename("配信", "話者1", ["a/b:c*d?e"])
-    assert "/" not in name and ":" not in name and "*" not in name and "?" not in name
+    base = {
+        "track": AudioTrack(index=0),
+        "track_count": 1,
+        "speaker": None,
+        "speakers_in_track": 1,
+        "name": None,
+    }
+    return NameSlot(**{**base, **kwargs})
+
+
+def test_output_name_single_track():
+    from koewake.cli import output_name
+
+    # 1トラック・1人 -> そのまま
+    assert output_name("配信", _slot()) == "配信.srt"
+    # 1トラック・複数人 -> 話者だけ付く
+    assert (
+        output_name("配信", _slot(speaker="話者2", speakers_in_track=2)) == "配信_話者2.srt"
+    )
+
+
+def test_output_name_multi_track():
+    from koewake.audio import AudioTrack
+    from koewake.cli import output_name
+
+    track2 = AudioTrack(index=1)
+    # 複数トラック・そのトラックは1人 -> トラック名だけ
+    assert (
+        output_name("配信", _slot(track=track2, track_count=2, speaker="話者1"))
+        == "配信_トラック2.srt"
+    )
+    # 複数トラック・そのトラックに複数人 -> 両方付く
+    assert (
+        output_name(
+            "配信",
+            _slot(track=track2, track_count=2, speaker="話者2", speakers_in_track=2),
+        )
+        == "配信_トラック2_話者2.srt"
+    )
+
+
+def test_output_name_uses_embedded_track_title():
+    from koewake.audio import AudioTrack
+    from koewake.cli import output_name
+
+    track = AudioTrack(index=1, title="BCさんマイク")
+    assert (
+        output_name("配信", _slot(track=track, track_count=2, speaker="話者1"))
+        == "配信_BCさんマイク.srt"
+    )
+
+
+def test_output_name_prefers_given_name_over_track():
+    from koewake.audio import AudioTrack
+    from koewake.cli import output_name
+
+    track = AudioTrack(index=1, title="BCさんマイク")
+    slot = _slot(track=track, track_count=2, speaker="話者2", speakers_in_track=2, name="C")
+    assert output_name("配信", slot) == "配信_C.srt"
+
+
+def test_output_name_sanitises_unsafe_characters():
+    from koewake.audio import AudioTrack
+    from koewake.cli import output_name
+
+    track = AudioTrack(index=1, title='a/b:c*d?e')
+    name = output_name("配信", _slot(track=track, track_count=2, speaker="話者1"))
+    assert not any(ch in name for ch in '/:*?"<>|')
     assert name.endswith(".srt")
 
 
@@ -134,8 +200,8 @@ def test_existing_outputs_finds_both_shapes(tmp_path):
     (tmp_path / "配信_話者2.srt").write_text("x", encoding="utf-8")
     (tmp_path / "別の動画.srt").write_text("x", encoding="utf-8")
 
-    names = {path.name for path in _existing_outputs(tmp_path, "配信", diarizing=True)}
+    names = {path.name for path in _existing_outputs(tmp_path, "配信", wide=True)}
     assert names == {"配信.srt", "配信_話者2.srt"}
 
-    names = {path.name for path in _existing_outputs(tmp_path, "配信", diarizing=False)}
+    names = {path.name for path in _existing_outputs(tmp_path, "配信", wide=False)}
     assert names == {"配信.srt"}

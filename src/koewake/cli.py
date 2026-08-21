@@ -13,12 +13,21 @@ import gc
 import json
 import shutil
 import sys
+import tempfile
 import time
+from collections import Counter
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 from koewake import __version__
-from koewake.audio import MEDIA_SUFFIXES, extract_audio, is_vertical, probe_duration
+from koewake.audio import (
+    MEDIA_SUFFIXES,
+    AudioTrack,
+    extract_audio,
+    is_vertical,
+    probe_audio_tracks,
+    probe_duration,
+)
 from koewake.diarize import DiarizationUnavailable, assign_speakers, diarize
 from koewake.engine import DEFAULT_QUALITY, QUALITY_PRESETS, EngineConfig, resolve_engine
 from koewake.progress import Progress
@@ -201,31 +210,161 @@ class Session:
     initial_prompt: str
     models: ModelCache
     progress: Progress
-    # None = 話者分離をしない / 0 = 人数は自動判定 / 1以上 = その人数
-    speakers: int | None = None
+    # None = 話者分離をしない。値があればトラックごとの人数（0 = 自動判定）。
+    speakers: list[int] | None = None
     speaker_names: list[str] = field(default_factory=list)
 
 
-def _extract(source: Path, session: Session) -> Path:
-    session.progress.start("音声を取り出しています")
+# ファイル名に使えない文字（Windows / macOS の両方を満たす範囲）
+_UNSAFE_IN_FILENAME = str.maketrans({char: "_" for char in '\\/:*?"<>|'})
+
+
+def _safe(text: str) -> str:
+    return text.translate(_UNSAFE_IN_FILENAME).strip() or "無名"
+
+
+def parse_speakers(value: str | None) -> list[int] | None:
+    """`--speakers` の値を解釈する。
+
+    None    -> 話者分離をしない
+    "auto"  -> 人数は自動判定（番兵として 0 を返す）
+    "2"     -> その人数
+    "1,2"   -> トラックごとの人数（音声が複数トラックあるとき）
+    """
+    if value is None:
+        return None
+
+    counts: list[int] = []
+    for part in value.split(","):
+        text = part.strip().lower()
+        if not text:
+            continue
+        if text in ("auto", "自動"):
+            counts.append(0)
+            continue
+        try:
+            count = int(text)
+        except ValueError as exc:
+            raise ValueError(
+                f"--speakers には auto か人数を指定してください（受け取った値: {value}）"
+            ) from exc
+        if count < 1:
+            raise ValueError("--speakers の人数は1以上にしてください")
+        counts.append(count)
+
+    if not counts:
+        raise ValueError(
+            f"--speakers には auto か人数を指定してください（受け取った値: {value}）"
+        )
+    return counts
+
+
+def speakers_for_track(spec: list[int], track_index: int, track_count: int) -> int:
+    """そのトラックに使う人数。1つだけ指定されていれば全トラックに同じ値を使う。"""
+    if len(spec) == 1:
+        return spec[0]
+    if len(spec) != track_count:
+        raise ValueError(
+            f"--speakers に人数が{len(spec)}個ありますが、音声は{track_count}トラックです。"
+            "数を合わせるか、1つだけ指定してください。"
+        )
+    return spec[track_index]
+
+
+def parse_speaker_names(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [name.strip() for name in value.split(",") if name.strip()]
+
+
+@dataclass(frozen=True)
+class NameSlot:
+    """出力1本ぶんの素性。ファイル名を決めるのに要る情報だけを持つ。"""
+
+    track: AudioTrack
+    track_count: int
+    speaker: str | None
+    speakers_in_track: int
+    name: str | None = None
+
+
+def output_name(stem: str, slot: NameSlot) -> str:
+    """出力するSRTのファイル名を決める。
+
+    名前が指定されていればそれだけを使う（トラック名は付けない）。
+    そうでなければ、区別に要るぶんだけ接尾辞を足す。
+
+      1トラック・1人       -> 動画.srt
+      1トラック・複数人    -> 動画_話者1.srt
+      複数トラック・1人    -> 動画_トラック1.srt
+      複数トラック・複数人 -> 動画_トラック1_話者1.srt
+    """
+    if slot.name:
+        return f"{stem}_{_safe(slot.name)}.srt"
+
+    parts: list[str] = []
+    if slot.track_count > 1:
+        parts.append(_safe(slot.track.label()))
+    if slot.speaker and slot.speakers_in_track > 1:
+        parts.append(_safe(slot.speaker))
+
+    if not parts:
+        return f"{stem}.srt"
+    return f"{stem}_{'_'.join(parts)}.srt"
+
+
+def _speaker_sort_key(speaker: str | None) -> tuple[int, int | str]:
+    if speaker is None:
+        return (0, 0)
+    if speaker.startswith("話者"):
+        suffix = speaker.removeprefix("話者")
+        if suffix.isdigit():
+            return (1, int(suffix))
+    return (2, speaker)
+
+
+@dataclass
+class FileJob:
+    """1つの動画を処理するあいだ持ち回るもの。"""
+
+    source: Path
+    tracks: list[AudioTrack]
+    layout: LayoutOptions
+    duration: float | None
+    work_dir: Path
+
+    @property
+    def track_count(self) -> int:
+        return len(self.tracks)
+
+
+def _track_note(track: AudioTrack, track_count: int) -> str:
+    return f"（{track.label()}）" if track_count > 1 else ""
+
+
+def _extract(job: FileJob, session: Session, track: AudioTrack) -> Path:
+    note = _track_note(track, job.track_count)
+    session.progress.start(f"音声を取り出しています{note}")
     try:
-        return extract_audio(source)
+        return extract_audio(job.source, job.work_dir, track=track.index)
     finally:
         session.progress.finish()
 
 
 def _transcribe_audio(
-    audio_path: Path, session: Session, duration: float | None
+    audio_path: Path, session: Session, duration: float | None, note: str
 ) -> list[Segment]:
     progress = session.progress
     model = session.models.get()
 
     # 最初のひとまとまりが返るまでは、進み具合が本当に分からない。
     # 0% のバーを出すと止まって見えるので、それまでは経過時間だけ出す。
-    progress.start("音声を解析しています")
+    progress.start(f"音声を解析しています{note}")
 
     def on_progress(ratio: float, text: str) -> None:
-        progress.update(ratio=ratio if duration else None, detail=text, label="文字起こし中")
+        progress.update(
+            ratio=ratio if duration else None, detail=text, label=f"文字起こし中{note}"
+        )
 
     try:
         return transcribe(
@@ -242,18 +381,18 @@ def _transcribe_audio(
 
 
 def _apply_diarization(
-    audio_path: Path, segments: list[Segment], session: Session
+    audio_path: Path, segments: list[Segment], session: Session, speakers: int, note: str
 ) -> list[Segment]:
     """話者を判別して、各区間に割り当てる。
 
-    失敗しても字幕そのものは作れるので、警告だけ出して1本のSRTに落とす。
+    失敗しても字幕そのものは作れるので、警告だけ出して1本にまとめる。
     """
     progress = session.progress
-    progress.start("声から話者を判別しています")
+    progress.start(f"声から話者を判別しています{note}")
     try:
         turns = diarize(
             audio_path,
-            speakers=session.speakers or None,
+            speakers=speakers or None,
             on_progress=lambda ratio, detail: progress.update(
                 ratio=ratio, detail=detail, label="話者分離モデルを準備しています"
             ),
@@ -261,26 +400,30 @@ def _apply_diarization(
     except DiarizationUnavailable as exc:
         progress.finish()
         _log(f"  [警告] 話者分離ができませんでした: {exc}")
-        _log("         話者で分けずに、1本のSRTを作ります。")
+        _log("         話者で分けずにまとめます。")
         return segments
     finally:
         progress.finish()
 
     if not turns:
-        _log("  [警告] 話者を判別できませんでした。1本のSRTを作ります。")
+        _log(f"  [警告] 話者を判別できませんでした{note}。まとめて出します。")
         return segments
 
     found = len({turn.speaker for turn in turns})
-    _log(f"  話者     : {found}人を検出")
+    _log(f"  話者     : {note or ''}{found}人を検出")
     return assign_speakers(segments, turns)
 
 
-def _existing_outputs(output_dir: Path, stem: str, diarizing: bool) -> list[Path]:
+def _existing_outputs(output_dir: Path, stem: str, wide: bool) -> list[Path]:
+    """すでにSRTがあるか。
+
+    `wide` のときは、話者やトラックの接尾辞が付いたものも探す
+    （何人・何トラックになるかは処理してみないと分からないため）。
+    """
     single = output_dir / f"{stem}.srt"
-    if not diarizing:
+    if not wide:
         return [single] if single.exists() else []
 
-    # 話者が1人だった場合は接尾辞なしで出るので、そちらも見る
     prefix = f"{stem}_"
     found = [
         path
@@ -292,29 +435,66 @@ def _existing_outputs(output_dir: Path, stem: str, diarizing: bool) -> list[Path
     return sorted(found)
 
 
-def _write_outputs(
-    source: Path,
+def _collect_groups(
+    job: FileJob, session: Session
+) -> tuple[list[tuple[AudioTrack, str | None, list[Cue]]], dict[int, list[Segment]]]:
+    """トラックごとに文字起こし・話者分離して、(トラック, 話者, 字幕) を集める。"""
+    groups: list[tuple[AudioTrack, str | None, list[Cue]]] = []
+    transcripts: dict[int, list[Segment]] = {}
+
+    for track in job.tracks:
+        note = _track_note(track, job.track_count)
+        audio_path = _extract(job, session, track)
+
+        segments = _transcribe_audio(audio_path, session, job.duration, note)
+        if not segments:
+            _log(
+                f"  [警告] 音声から文字を取れませんでした{note or ''}。"
+                "このトラックは飛ばします。"
+            )
+            continue
+
+        if session.speakers is not None:
+            segments = _apply_diarization(
+                audio_path,
+                segments,
+                session,
+                speakers_for_track(session.speakers, track.index, job.track_count),
+                note,
+            )
+
+        session.progress.start(f"字幕として整形しています{note}")
+        try:
+            grouped = build_cues_by_speaker(segments, job.layout)
+        finally:
+            session.progress.finish()
+
+        transcripts[track.index] = segments
+        for speaker in sorted(grouped, key=_speaker_sort_key):
+            groups.append((track, speaker, grouped[speaker]))
+
+    return groups, transcripts
+
+
+def _write_groups(
+    job: FileJob,
     output_dir: Path,
-    segments: list[Segment],
-    layout: LayoutOptions,
+    groups: list[tuple[AudioTrack, str | None, list[Cue]]],
     session: Session,
 ) -> list[tuple[Path, int]]:
-    session.progress.start("字幕として整形しています")
-    try:
-        grouped = build_cues_by_speaker(segments, layout)
-    finally:
-        session.progress.finish()
-
-    # ひとりしか居ないなら分ける意味がないので、従来どおり「動画名.srt」にする。
-    # （ソロ配信を毎回ドロップする使い方で、_話者1 が付くのは邪魔なだけ）
-    solo = len(grouped) == 1 and not session.speaker_names
+    speakers_per_track = Counter(track.index for track, _, _ in groups)
+    names = session.speaker_names
 
     written: list[tuple[Path, int]] = []
-    for speaker in sorted(grouped, key=_speaker_sort_key):
-        cues: list[Cue] = grouped[speaker]
-        path = output_dir / speaker_filename(
-            source.stem, None if solo else speaker, session.speaker_names
+    for index, (track, speaker, cues) in enumerate(groups):
+        slot = NameSlot(
+            track=track,
+            track_count=job.track_count,
+            speaker=speaker,
+            speakers_in_track=speakers_per_track[track.index],
+            name=names[index] if index < len(names) else None,
         )
+        path = output_dir / output_name(job.source.stem, slot)
         path.write_text(
             render_srt(cues), encoding=ENCODINGS[session.args.encoding], newline=""
         )
@@ -335,8 +515,15 @@ def process_one(source: Path, session: Session, position: str = "") -> Outcome:
     output_dir = args.output_dir or source.parent
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    tracks = probe_audio_tracks(source)
     diarizing = session.speakers is not None
-    existing = _existing_outputs(output_dir, source.stem, diarizing)
+    if diarizing:
+        # 指定した人数の個数がトラック数と合わないなら、ここで止める
+        speakers_for_track(session.speakers, 0, len(tracks))
+
+    existing = _existing_outputs(
+        output_dir, source.stem, wide=diarizing or len(tracks) > 1
+    )
     if existing and not args.overwrite:
         names = "、".join(path.name for path in existing[:3])
         _log(f"[スキップ] すでにSRTがあります（--overwrite で上書き）: {names}")
@@ -350,100 +537,48 @@ def process_one(source: Path, session: Session, position: str = "") -> Outcome:
     _log(f"  字幕     : 1行{layout.max_chars_per_line}文字 x 最大{layout.max_lines}行")
     if duration:
         _log(f"  尺       : {_format_seconds(duration)}")
+    if len(tracks) > 1:
+        _log(f"  音声     : {len(tracks)}トラック（{'、'.join(t.label() for t in tracks)}）")
 
     started = time.monotonic()
-    work_dir = None
+    job = FileJob(
+        source=source,
+        tracks=tracks,
+        layout=layout,
+        duration=duration,
+        work_dir=Path(tempfile.mkdtemp(prefix="koewake-")),
+    )
     try:
-        audio_path = _extract(source, session)
-        work_dir = audio_path.parent
-
-        segments = _transcribe_audio(audio_path, session, duration)
-        if not segments:
-            _log("  [失敗] 音声から文字を取れませんでした（無音・BGMのみの可能性）")
-            return Outcome(Outcome.FAILED)
-
-        if diarizing:
-            segments = _apply_diarization(audio_path, segments, session)
+        groups, transcripts = _collect_groups(job, session)
     finally:
-        if work_dir and work_dir.name.startswith("koewake-"):
-            shutil.rmtree(work_dir, ignore_errors=True)
+        shutil.rmtree(job.work_dir, ignore_errors=True)
 
-    written = _write_outputs(source, output_dir, segments, layout, session)
+    if not groups:
+        _log("  [失敗] 音声から文字を取れませんでした（無音・BGMのみの可能性）")
+        return Outcome(Outcome.FAILED)
+
+    written = _write_groups(job, output_dir, groups, session)
 
     if args.save_transcript:
-        transcript_path = output_dir / f"{source.stem}.transcript.json"
-        transcript_path.write_text(
-            json.dumps([asdict(segment) for segment in segments], ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        _log(f"  文字起こしデータ: {transcript_path.name}")
+        for track in tracks:
+            segments = transcripts.get(track.index)
+            if not segments:
+                continue
+            suffix = f"_{_safe(track.label())}" if len(tracks) > 1 else ""
+            transcript_path = output_dir / f"{source.stem}{suffix}.transcript.json"
+            transcript_path.write_text(
+                json.dumps(
+                    [asdict(segment) for segment in segments], ensure_ascii=False, indent=2
+                ),
+                encoding="utf-8",
+            )
+            _log(f"  文字起こしデータ: {transcript_path.name}")
 
     elapsed = time.monotonic() - started
     _log(f"  [完了] 所要 {_format_seconds(elapsed)}")
     for path, count in written:
         _log(f"    {path}（字幕 {count} 枚）")
     return Outcome(Outcome.MADE, [path for path, _ in written])
-
-
-# ファイル名に使えない文字（Windows / macOS の両方を満たす範囲）
-_UNSAFE_IN_FILENAME = str.maketrans({char: "_" for char in '\\/:*?"<>|'})
-
-
-def parse_speakers(value: str | None) -> int | None:
-    """`--speakers` の値を解釈する。
-
-    None       -> 話者分離をしない
-    "auto"     -> 人数は自動判定（0 を返す）
-    "2" など   -> その人数
-    """
-    if value is None:
-        return None
-    text = value.strip().lower()
-    if text in ("auto", "自動"):
-        return 0
-    try:
-        count = int(text)
-    except ValueError as exc:
-        raise ValueError(
-            f"--speakers には auto か人数を指定してください（受け取った値: {value}）"
-        ) from exc
-    if count < 1:
-        raise ValueError("--speakers の人数は1以上にしてください")
-    return count
-
-
-def parse_speaker_names(value: str | None) -> list[str]:
-    if not value:
-        return []
-    return [name.strip() for name in value.split(",") if name.strip()]
-
-
-def speaker_filename(stem: str, speaker: str | None, names: list[str]) -> str:
-    """話者ごとのSRTのファイル名。"""
-    if speaker is None:
-        return f"{stem}.srt"
-
-    label = speaker
-    # 「話者2」の 2 番目 -> names[1]
-    if speaker.startswith("話者"):
-        try:
-            index = int(speaker.removeprefix("話者")) - 1
-        except ValueError:
-            index = -1
-        if 0 <= index < len(names):
-            label = names[index]
-
-    return f"{stem}_{label.translate(_UNSAFE_IN_FILENAME)}.srt"
-
-
-def _speaker_sort_key(speaker: str | None) -> tuple[int, int | str]:
-    if speaker is None:
-        return (0, 0)
-    if speaker.startswith("話者"):
-        suffix = speaker.removeprefix("話者")
-        if suffix.isdigit():
-            return (1, int(suffix))
-    return (2, speaker)
 
 
 def _report(made: list[Path], failed: int) -> None:

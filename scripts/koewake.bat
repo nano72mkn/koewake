@@ -27,6 +27,9 @@ echo   そのまま Enter =^> 分けない（1本のSRT）
 echo   人数を入力     =^> その人数で分ける（例: 2）
 echo   a              =^> 人数もおまかせで判定
 echo.
+echo ※ マイクをトラックごとに分けて録っている動画は、
+echo   ここで何を選んでもトラックごとに分かれます。
+echo.
 set "ANSWER="
 set /p "ANSWER=話者: "
 
