@@ -22,6 +22,16 @@ dependencies = [
     "numpy>=1.24",
 ]
 
+[project.optional-dependencies]
+# NVIDIA GPU で動かすための CUDA ライブラリ（Windows / Linux）。
+# faster-whisper の wheel には入っていないので、別に入れる必要がある。
+# 合計 1GB 近くあり、GPU が無ければ完全に無駄なので既定では入れない。
+# macOS には NVIDIA GPU が無く wheel も無いので、そこでは何も入れない。
+cuda = [
+    "nvidia-cublas-cu12>=12.3; sys_platform != 'darwin'",
+    "nvidia-cudnn-cu12>=9.1,<10; sys_platform != 'darwin'",
+]
+
 [project.scripts]
 koewake = "koewake.cli:run"
 

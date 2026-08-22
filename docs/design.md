@@ -299,6 +299,45 @@ CP932 として読むこと。文字化けした断片が**コマンドとして
 `tests/test_launchers.py` で `.bat` に非ASCII文字が入らないことを固定した
 （`chcp 65001` と `PYTHONUTF8=1` が残っていることも確認する）。
 
+### 5-5. GPU が使えなくても止めない
+
+Windows 実機で、こう落ちた。
+
+```
+[エラー] Library cublas64_12.dll is not found or cannot be loaded
+```
+
+`ctranslate2` は **CUDA デバイスの有無しか見ない**ので、GPU が挿さっていれば
+「GPUあり」と判定する。ところが cuBLAS / cuDNN は faster-whisper の wheel に
+入っていないため、モデル読み込みの段階で落ちる。
+
+対策は2つ。
+
+1. **落ちたら CPU に切り替えて続ける**（`fallback_to_cpu`）。
+   利用者が自分だけで回せることが要件なので、止まるのが一番まずい。
+   警告を出したうえで処理は完了させる。
+2. **GPU を使いたい人向けの導線**を用意する。`cuda` extra で
+   `nvidia-cublas-cu12` / `nvidia-cudnn-cu12` を入れる
+   （`scripts/setup-windows-gpu.bat`）。合計1GB近くあり、GPU が無ければ
+   完全に無駄なので既定では入れない。macOS では marker で無効化してある。
+
+なお、pip で入れた CUDA ライブラリは site-packages の下に置かれるが、
+**Windows の Python はそこを DLL の探索先に含めない**。
+`ctranslate2` を読み込む前に `os.add_dll_directory()` で足している
+（`_register_cuda_dll_dirs`）。これが無いと extra を入れても見つからない。
+
+### 5-6. huggingface_hub の案内メッセージを止める
+
+進捗表示の行に割り込んで表示を壊すので、2つとも黙らせている。
+
+- `HF_HUB_VERBOSITY=error` … HF_TOKEN の案内
+- `HF_HUB_DISABLE_SYMLINKS_WARNING=1` … Windows の symlink の案内
+
+⚠️ **`huggingface_hub` より先に設定しないと効かない**。最初は
+`download_model()` の中で設定していたが、その手前で
+`import faster_whisper` が huggingface_hub を連れてくるため手遅れだった。
+今は `transcribe.py` のモジュール読み込み時に設定している。
+
 ### 6. モデルの置き場所### 5-3. 音声が複数トラックある動画
 
 マイクを人ごとに分けて録っていれば、推測に頼らず確実に分けられる。
@@ -356,6 +395,45 @@ CP932 として読むこと。文字化けした断片が**コマンドとして
 
 `tests/test_launchers.py` で `.bat` に非ASCII文字が入らないことを固定した
 （`chcp 65001` と `PYTHONUTF8=1` が残っていることも確認する）。
+
+### 5-5. GPU が使えなくても止めない
+
+Windows 実機で、こう落ちた。
+
+```
+[エラー] Library cublas64_12.dll is not found or cannot be loaded
+```
+
+`ctranslate2` は **CUDA デバイスの有無しか見ない**ので、GPU が挿さっていれば
+「GPUあり」と判定する。ところが cuBLAS / cuDNN は faster-whisper の wheel に
+入っていないため、モデル読み込みの段階で落ちる。
+
+対策は2つ。
+
+1. **落ちたら CPU に切り替えて続ける**（`fallback_to_cpu`）。
+   利用者が自分だけで回せることが要件なので、止まるのが一番まずい。
+   警告を出したうえで処理は完了させる。
+2. **GPU を使いたい人向けの導線**を用意する。`cuda` extra で
+   `nvidia-cublas-cu12` / `nvidia-cudnn-cu12` を入れる
+   （`scripts/setup-windows-gpu.bat`）。合計1GB近くあり、GPU が無ければ
+   完全に無駄なので既定では入れない。macOS では marker で無効化してある。
+
+なお、pip で入れた CUDA ライブラリは site-packages の下に置かれるが、
+**Windows の Python はそこを DLL の探索先に含めない**。
+`ctranslate2` を読み込む前に `os.add_dll_directory()` で足している
+（`_register_cuda_dll_dirs`）。これが無いと extra を入れても見つからない。
+
+### 5-6. huggingface_hub の案内メッセージを止める
+
+進捗表示の行に割り込んで表示を壊すので、2つとも黙らせている。
+
+- `HF_HUB_VERBOSITY=error` … HF_TOKEN の案内
+- `HF_HUB_DISABLE_SYMLINKS_WARNING=1` … Windows の symlink の案内
+
+⚠️ **`huggingface_hub` より先に設定しないと効かない**。最初は
+`download_model()` の中で設定していたが、その手前で
+`import faster_whisper` が huggingface_hub を連れてくるため手遅れだった。
+今は `transcribe.py` のモジュール読み込み時に設定している。
 
 ### 6. モデルの置き場所
 

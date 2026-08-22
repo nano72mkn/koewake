@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -16,6 +17,18 @@ from pathlib import Path
 from koewake.engine import EngineConfig
 from koewake.progress import format_bytes
 from koewake.subtitle import Segment, Word
+
+# huggingface_hub の案内メッセージを黙らせる。
+#
+# どちらも進捗表示の行に割り込んで表示を壊すだけで、動作には関係ない。
+#   - HF_TOKEN の案内: 公開モデルを取るだけなので不要
+#   - symlink の案内 : Windows で出る。キャッシュが少し嵩むだけ
+#
+# **huggingface_hub より先に設定しないと効かない**ので、関数の中ではなく
+# ここ（モジュールの読み込み時）で行う。faster-whisper は huggingface_hub を
+# 連れてくるため、`import faster_whisper` の後では手遅れになる。
+os.environ.setdefault("HF_HUB_VERBOSITY", "error")
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 ProgressCallback = Callable[[float, str], None]
 
@@ -158,11 +171,6 @@ def download_model(name: str, on_progress: ProgressCallback | None = None) -> st
     ここは自前で `snapshot_download` を呼び、何MB進んだかを拾えるようにしている。
     1.5GB のダウンロードが無反応に見えるのが一番つらいため。
     """
-    # 「HF_TOKEN を設定すると速いよ」という案内を黙らせる。公開モデルを取るだけなので
-    # 不要な上、進捗表示に割り込んで行が乱れる。
-    # （logging の setLevel は huggingface_hub 側があとから上書きするので効かない）
-    os.environ.setdefault("HF_HUB_VERBOSITY", "error")
-
     import huggingface_hub
     from faster_whisper.utils import _MODELS
 
@@ -181,12 +189,44 @@ def download_model(name: str, on_progress: ProgressCallback | None = None) -> st
     return huggingface_hub.snapshot_download(_MODELS.get(name, name), **kwargs)
 
 
+def _register_cuda_dll_dirs() -> None:
+    """Windows で、pip で入れた CUDA ライブラリを見つけられるようにする。
+
+    `nvidia-cublas-cu12` などは DLL を site-packages の下に置くが、
+    Windows の Python はそこを DLL の探索先に含めない。
+    `ctranslate2` を読み込む前に、明示的に探索先へ足しておく必要がある。
+
+    （これをしないと「Library cublas64_12.dll is not found」で落ちる）
+    """
+    if not sys.platform.startswith("win"):
+        return
+
+    import site
+
+    roots = list(site.getsitepackages())
+    user_site = site.getusersitepackages()
+    if isinstance(user_site, str):
+        roots.append(user_site)
+
+    for root in roots:
+        nvidia = Path(root) / "nvidia"
+        if not nvidia.is_dir():
+            continue
+        for bin_dir in nvidia.glob("*/bin"):
+            try:
+                os.add_dll_directory(str(bin_dir))
+            except OSError:
+                continue
+
+
 def load_model(engine: EngineConfig, on_progress: ProgressCallback | None = None):
     """Whisper のモデルを読み込む。
 
     初回はモデル本体（large 系で 1.5GB 前後）をダウンロードするので時間がかかる。
     複数ファイルを処理するときに読み直さずに済むよう、`transcribe()` から分けてある。
     """
+    _register_cuda_dll_dirs()
+
     from faster_whisper import WhisperModel
 
     source = engine.model

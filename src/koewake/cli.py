@@ -29,7 +29,13 @@ from koewake.audio import (
     probe_duration,
 )
 from koewake.diarize import DiarizationUnavailable, assign_speakers, diarize
-from koewake.engine import DEFAULT_QUALITY, QUALITY_PRESETS, EngineConfig, resolve_engine
+from koewake.engine import (
+    DEFAULT_QUALITY,
+    QUALITY_PRESETS,
+    EngineConfig,
+    fallback_to_cpu,
+    resolve_engine,
+)
 from koewake.progress import Progress
 from koewake.prompt import ask_inputs, ask_speakers, print_welcome
 from koewake.subtitle import (
@@ -62,18 +68,43 @@ class ModelCache:
         self.progress = progress
         self._model = None
 
+    def _load(self):
+        return load_model(
+            self.engine,
+            on_progress=lambda ratio, detail: self.progress.update(
+                ratio=ratio, detail=detail, label="モデルをダウンロード中"
+            ),
+        )
+
     def get(self):
-        if self._model is None:
-            self.progress.start("モデルを準備しています（初回はダウンロードあり）")
+        if self._model is not None:
+            return self._model
+
+        self.progress.start("モデルを準備しています（初回はダウンロードあり）")
+        try:
+            self._model = self._load()
+        except Exception as exc:
+            self.progress.finish()
+            if self.engine.device != "cuda":
+                raise
+
+            # CUDA デバイスはあるのに cuBLAS / cuDNN が無い、という状態。
+            # 実行そのものは CPU で続けられるので、落とさずに切り替える。
+            _log(f"  [警告] GPUを使えませんでした: {exc}")
+            _log("         CPUに切り替えて続けます（そのぶん時間がかかります）。")
+            if sys.platform.startswith("win"):
+                _log("         GPUを使うには setup-windows-gpu.bat を実行してください。")
+            self.engine = fallback_to_cpu(self.engine)
+            _log(f"  エンジン : {self.engine.describe()}")
+
+            self.progress.start("モデルを準備しています")
             try:
-                self._model = load_model(
-                    self.engine,
-                    on_progress=lambda ratio, detail: self.progress.update(
-                        ratio=ratio, detail=detail, label="モデルをダウンロード中"
-                    ),
-                )
+                self._model = self._load()
             finally:
                 self.progress.finish()
+        else:
+            self.progress.finish()
+
         return self._model
 
 

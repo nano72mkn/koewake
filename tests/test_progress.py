@@ -137,3 +137,37 @@ def test_detail_is_dropped_rather_than_shown_as_a_fragment():
 def test_detail_appears_when_there_is_room():
     line = render_line(_state(ratio=0.36, elapsed=3.0, detail="28MB / 78MB"), "|", 160)
     assert "28MB / 78MB" in line
+
+
+def test_fallback_to_cpu_keeps_the_model_but_switches_device():
+    from koewake.engine import EngineConfig, fallback_to_cpu
+
+    engine = EngineConfig(
+        model="large-v3-turbo", device="cuda", compute_type="float16", cpu_threads=8
+    )
+    fallen = fallback_to_cpu(engine)
+
+    assert fallen.device == "cpu"
+    # CPU では float16 は使えないので int8 に落とす
+    assert fallen.compute_type == "int8"
+    # モデルとスレッド数は引き継ぐ
+    assert fallen.model == "large-v3-turbo"
+    assert fallen.cpu_threads == 8
+    assert "CPU" in fallen.describe()
+
+
+def test_registering_cuda_dll_dirs_is_harmless_off_windows():
+    from koewake.transcribe import _register_cuda_dll_dirs
+
+    # Windows 以外では何もしない（例外も出さない）
+    _register_cuda_dll_dirs()
+
+
+def test_huggingface_warnings_are_silenced_at_import_time():
+    """環境変数は huggingface_hub より先に設定されている必要がある。"""
+    import os
+
+    import koewake.transcribe  # noqa: F401  読み込むだけで設定される
+
+    assert os.environ.get("HF_HUB_VERBOSITY") == "error"
+    assert os.environ.get("HF_HUB_DISABLE_SYMLINKS_WARNING") == "1"

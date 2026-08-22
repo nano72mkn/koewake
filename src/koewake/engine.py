@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 # 品質プリセット -> Whisper モデル名
 QUALITY_PRESETS: dict[str, str] = {
@@ -32,6 +32,16 @@ class EngineConfig:
     def describe(self) -> str:
         where = "GPU (CUDA)" if self.device == "cuda" else f"CPU ({self.cpu_threads}スレッド)"
         return f"{self.model} / {where} / {self.compute_type}"
+
+
+def fallback_to_cpu(engine: EngineConfig) -> EngineConfig:
+    """GPU が使えなかったときの、CPU 版の設定。
+
+    `ctranslate2` は CUDA デバイスの有無しか見ないので、
+    cuBLAS / cuDNN が入っていない環境では「GPUあり」と判定したあとに
+    モデル読み込みで落ちる。そのときここに落として実行を続ける。
+    """
+    return replace(engine, device="cpu", compute_type="int8")
 
 
 def _cuda_device_count() -> int:

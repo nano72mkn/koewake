@@ -12,6 +12,21 @@
 
 ---
 
+## NVIDIA GPU を使う（Windows・任意）
+
+GPU があると文字起こしがかなり速くなりますが、faster-whisper には CUDA の
+ライブラリが同梱されていません。そのままだとこう出ます。
+
+```
+[警告] GPUを使えませんでした: Library cublas64_12.dll is not found or cannot be loaded
+       CPUに切り替えて続けます（そのぶん時間がかかります）。
+```
+
+**このままでも動きます**（CPUで処理されます）。速くしたい場合だけ、
+`scripts\setup-windows-gpu.bat` をダブルクリックしてください。約1GBのダウンロードです。
+
+---
+
 ## つかいかた
 
 ### 1. 最初の1回だけ：セットアップ
