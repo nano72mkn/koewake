@@ -31,6 +31,7 @@ from koewake.audio import (
 from koewake.diarize import DiarizationUnavailable, assign_speakers, diarize
 from koewake.engine import DEFAULT_QUALITY, QUALITY_PRESETS, EngineConfig, resolve_engine
 from koewake.progress import Progress
+from koewake.prompt import ask_inputs, ask_speakers, print_welcome
 from koewake.subtitle import (
     VERTICAL_LAYOUT,
     Cue,
@@ -39,7 +40,13 @@ from koewake.subtitle import (
     build_cues_by_speaker,
     render_srt,
 )
-from koewake.transcribe import TranscribeOptions, load_model, load_vocabulary, transcribe
+from koewake.transcribe import (
+    TranscribeOptions,
+    find_default_vocabulary,
+    load_model,
+    load_vocabulary,
+    transcribe,
+)
 
 
 class ModelCache:
@@ -111,7 +118,9 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="例: koewake ライブ配信.mp4 --vocab よく使う単語.txt",
     )
-    parser.add_argument("inputs", nargs="+", type=Path, help="動画または音声ファイル")
+    parser.add_argument(
+        "inputs", nargs="*", type=Path, help="動画または音声ファイル（省略すると聞かれます）"
+    )
     parser.add_argument("-o", "--output-dir", type=Path, help="SRTの出力先（既定: 入力と同じ場所）")
     parser.add_argument(
         "-q", "--quality",
@@ -162,6 +171,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--overwrite", action="store_true", help="既存のSRTを上書きする")
     parser.add_argument(
         "--no-progress", action="store_true", help="進捗のアニメーションを出さない"
+    )
+    parser.add_argument(
+        "--ask-speakers",
+        action="store_true",
+        help="話者ごとに分けるかどうかを対話でたずねる（ドラッグ＆ドロップ用）",
+    )
+    parser.add_argument(
+        "--welcome",
+        action="store_true",
+        help="セットアップ後の案内を表示して終了する（セットアップスクリプト用）",
     )
     parser.add_argument("--version", action="version", version=f"koewake {__version__}")
     return parser
@@ -593,36 +612,31 @@ def _report(made: list[Path], failed: int) -> None:
         _log("つくるものがありませんでした。")
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+class ConfigError(Exception):
+    """指定の組み合わせがおかしい、というだけのエラー。"""
 
+
+def _build_session(args: argparse.Namespace) -> Session:
     initial_prompt = ""
-    if args.vocab:
-        if not args.vocab.exists():
-            _log(f"[エラー] 単語リストが見つかりません: {args.vocab}")
-            return 1
-        initial_prompt = load_vocabulary(args.vocab)
+    vocab = args.vocab
+    if vocab and not vocab.exists():
+        raise ConfigError(f"単語リストが見つかりません: {vocab}")
+    if vocab is None:
+        # 置いてあれば拾う（ランチャーから渡さなくて済むように）
+        vocab = find_default_vocabulary()
+    if vocab:
+        initial_prompt = load_vocabulary(vocab)
         if initial_prompt:
-            _log(f"単語リストを読み込みました（{args.vocab.name}）")
+            _log(f"単語リストを読み込みました（{vocab.name}）")
 
-    sources = collect_inputs(args.inputs)
-    if not sources:
-        _log("[エラー] 処理できるファイルがありませんでした。")
-        return 1
-
-    try:
-        speakers = parse_speakers(args.speakers)
-    except ValueError as exc:
-        _log(f"[エラー] {exc}")
-        return 1
+    speakers = parse_speakers(args.speakers)
     speaker_names = parse_speaker_names(args.speaker_names)
     if speaker_names and speakers is None:
-        _log("[エラー] --speaker-names は --speakers と一緒に指定してください。")
-        return 1
+        raise ConfigError("--speaker-names は --speakers と一緒に指定してください。")
 
     engine = resolve_engine(quality=args.quality, model=args.model, device=args.device)
     progress = Progress(enabled=False if args.no_progress else None)
-    session = Session(
+    return Session(
         args=args,
         initial_prompt=initial_prompt,
         models=ModelCache(engine, progress),
@@ -631,18 +645,21 @@ def main(argv: list[str] | None = None) -> int:
         speaker_names=speaker_names,
     )
 
+
+def _run(sources: list[Path], session: Session) -> int:
     made: list[Path] = []
     failed = 0
+
     for index, source in enumerate(sources, start=1):
         position = f"[{index}/{len(sources)}] " if len(sources) > 1 else ""
         try:
             outcome = process_one(source, session, position)
         except KeyboardInterrupt:
-            progress.finish()
+            session.progress.finish()
             _log("\n中断しました。")
             return 130
         except Exception as exc:
-            progress.finish()
+            session.progress.finish()
             failed += 1
             _log(f"  [エラー] {source.name}: {exc}")
             continue
@@ -654,6 +671,35 @@ def main(argv: list[str] | None = None) -> int:
 
     _report(made, failed)
     return 1 if failed else 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+
+    if args.welcome:
+        print_welcome()
+        return 0
+
+    inputs = list(args.inputs) or ask_inputs()
+    if not inputs:
+        _log("終了します。")
+        return 0
+
+    if args.ask_speakers and args.speakers is None:
+        args.speakers = ask_speakers()
+
+    try:
+        session = _build_session(args)
+    except (ConfigError, ValueError) as exc:
+        _log(f"[エラー] {exc}")
+        return 1
+
+    sources = collect_inputs(inputs)
+    if not sources:
+        _log("[エラー] 処理できるファイルがありませんでした。")
+        return 1
+
+    return _run(sources, session)
 
 
 def run() -> None:

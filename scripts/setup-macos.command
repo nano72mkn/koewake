@@ -1,23 +1,23 @@
 #!/bin/bash
-# こえわけ セットアップ（最初の1回だけ）
+# koewake セットアップ（最初の1回だけ）
 set -u
-cd "$(dirname "$0")/.." || exit 1
+cd "$(cd "$(dirname "$0")" && pwd)/.." || exit 1
 
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 echo "=========================================="
-echo "  こえわけ セットアップ（最初の1回だけ）"
+echo "  こえわけ セットアップ"
 echo "=========================================="
 echo
 
 if ! command -v uv >/dev/null 2>&1; then
     echo "必要なツール (uv) をインストールしています..."
-    curl -LsSf https://astral.sh/uv/install.sh | sh || {
+    if ! curl -LsSf https://astral.sh/uv/install.sh | sh; then
         echo
         echo "[エラー] uv のインストールに失敗しました。"
         read -r -p "Enter キーで閉じます "
         exit 1
-    }
+    fi
     export PATH="$HOME/.local/bin:$PATH"
 fi
 
@@ -30,11 +30,7 @@ if ! uv sync; then
     exit 1
 fi
 
-echo
-echo "=========================================="
-echo "  セットアップ完了！"
-echo
-echo "  これからは koewake.command を開いて、"
-echo "  動画ファイルをウィンドウにドラッグしてください。"
-echo "=========================================="
+# 案内は Python 側（両OSで同じ文言を使う）
+uv run koewake --welcome
+
 read -r -p "Enter キーで閉じます "

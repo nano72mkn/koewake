@@ -1,16 +1,23 @@
 @echo off
+rem ---------------------------------------------------------------
+rem  koewake setup (Windows) - run this once.
+rem
+rem  IMPORTANT: Keep this file ASCII-only. See koewake.bat for why.
+rem  Japanese guidance is printed by Python at the end.
+rem ---------------------------------------------------------------
 chcp 65001 >nul
+set "PYTHONUTF8=1"
 setlocal
 cd /d "%~dp0.."
 
 echo ==========================================
-echo   こえわけ セットアップ（最初の1回だけ）
+echo   koewake setup
 echo ==========================================
 echo.
 
 where uv >nul 2>&1
 if errorlevel 1 (
-    echo 必要なツール ^(uv^) をインストールしています...
+    echo Installing uv ...
     powershell -ExecutionPolicy Bypass -c "irm https://astral.sh/uv/install.ps1 | iex"
     set "PATH=%USERPROFILE%\.local\bin;%PATH%"
 )
@@ -18,27 +25,23 @@ if errorlevel 1 (
 where uv >nul 2>&1
 if errorlevel 1 (
     echo.
-    echo [エラー] uv のインストールに失敗しました。
-    echo この画面の内容をコピーして、開発者に相談してください。
+    echo [ERROR] Could not install uv.
+    echo Show this screen to the developer.
     pause
     exit /b 1
 )
 
 echo.
-echo 必要なものをダウンロードしています。数分かかります...
+echo Downloading dependencies. This takes a few minutes ...
 uv sync
 if errorlevel 1 (
     echo.
-    echo [エラー] セットアップに失敗しました。この画面の内容をコピーして、開発者に相談してください。
+    echo [ERROR] Setup failed. Show this screen to the developer.
     pause
     exit /b 1
 )
 
-echo.
-echo ==========================================
-echo   セットアップ完了！
-echo.
-echo   これからは、動画ファイルを
-echo   koewake.bat にドラッグ＆ドロップしてください。
-echo ==========================================
+rem Japanese guidance comes from Python, so this file stays ASCII.
+uv run koewake --welcome
+
 pause

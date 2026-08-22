@@ -75,6 +75,27 @@ def _drop_consecutive_repeats(segments: list[Segment], limit: int) -> list[Segme
     return kept
 
 
+# 置いてあれば自動で読む単語リストの名前と、探す場所
+DEFAULT_VOCAB_NAMES = ("単語リスト.txt", "vocab.txt")
+DEFAULT_VOCAB_FOLDERS = ("scripts", ".")
+
+
+def find_default_vocabulary(root: Path | None = None) -> Path | None:
+    """単語リストが置いてあれば、そのパスを返す。
+
+    ランチャーから `--vocab` を渡さずに済ませるための仕組み。
+    こうしておくと `.bat` に日本語のファイル名を書かなくてよくなる
+    （cmd.exe が CP932 で読むため、`.bat` は ASCII だけにしたい）。
+    """
+    root = root or Path.cwd()
+    for folder in DEFAULT_VOCAB_FOLDERS:
+        for name in DEFAULT_VOCAB_NAMES:
+            candidate = root / folder / name
+            if candidate.is_file():
+                return candidate
+    return None
+
+
 def load_vocabulary(path: Path) -> str:
     """固有名詞リスト（1行1語 / # でコメント）を Whisper の initial_prompt に変換する。"""
     terms: list[str] = []

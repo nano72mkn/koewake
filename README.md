@@ -167,8 +167,9 @@ uv run koewake コラボ配信.mkv --speakers auto --speaker-names Aさん,Bさ�
 ヴァルハザク   # 敵の名前
 ```
 
-`scripts/` フォルダに `単語リスト.txt` という名前で置いておけば、自動で読み込みます。
-`scripts/単語リスト.example.txt` をコピーして使ってください。
+`scripts/` フォルダに `単語リスト.txt` という名前で置いておけば、自動で読み込みます
+（`scripts/単語リスト.example.txt` をコピーしてください）。
+コマンドから明示する場合は `--vocab` を使います。
 
 ---
 
@@ -205,6 +206,22 @@ uv run koewake フォルダ/ --overwrite            # フォルダごとまと�
 
 技術選定の理由と Phase 2 の計画は [docs/design.md](docs/design.md) にあります。
 
+## Windows の `.bat` について
+
+`scripts/*.bat` は **ASCII だけで書く**こと。
+
+日本語版 Windows の cmd.exe は `.bat` を CP932 として読むため、UTF-8 で保存した
+日本語が文字化けし、その断片をコマンドとして実行してしまいます。
+
+```
+'医′縺ゅｌ縺ｰ閾ｪ蜍輔〒菴ｿ縺・set' は、内部コマンドまたは外部コマンド、
+操作可能なプログラムまたはバッチ ファイルとして認識されていません。
+```
+
+画面に出す文言と入力の受け付けは `src/koewake/prompt.py` に置き、`.bat` は
+起動するだけにしてあります。両OSで同じコードが動くという利点もあります。
+`tests/test_launchers.py` が非ASCII文字の混入を検出します。
+
 ## 開発
 
 ```bash
@@ -219,6 +236,7 @@ src/koewake/
   progress.py    進捗表示（別スレッドで回すアニメーション）
   diarize.py     話者分離（誰が喋ったかを判別して振り分ける）
   modelstore.py  話者分離モデルの取得とキャッシュ
+  prompt.py      対話でたずねる部分（Windows対策でここに集約）
   engine.py      GPU/CPU とモデルの自動選択
   transcribe.py  音声 -> テキスト（faster-whisper。差し替え可能な層）
   subtitle.py    テキスト -> 読める字幕 -> SRT
